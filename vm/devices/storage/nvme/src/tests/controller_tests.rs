@@ -1356,9 +1356,12 @@ async fn test_mandatory_features_roundtrip(driver: DefaultDriver) {
         .with_fid(spec::Feature::ARBITRATION.0)
         .with_sel(1)
         .into();
-    submit!(sel_cmd, spec::Status::INVALID_FIELD_IN_COMMAND.0);
-
-    let _ = admin_slot;
+    // This is the last command submitted, so the `admin_slot` increment inside
+    // `submit!` is never read afterwards.
+    #[expect(unused_assignments, reason = "final submit! bumps admin_slot")]
+    {
+        submit!(sel_cmd, spec::Status::INVALID_FIELD_IN_COMMAND.0);
+    }
 }
 
 /// CNS 06h (I/O Command Set specific Identify Controller): the NVM command set

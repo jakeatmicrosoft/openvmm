@@ -768,11 +768,11 @@ pub struct Cdw11FeatureArbitration {
     pub ab: u8,
     #[bits(5)]
     _rsvd: u8,
-    /// Low Priority Weight (0's based)
+    /// Low Priority Weight (0-based)
     pub lpw: u8,
-    /// Medium Priority Weight (0's based)
+    /// Medium Priority Weight (0-based)
     pub mpw: u8,
-    /// High Priority Weight (0's based)
+    /// High Priority Weight (0-based)
     pub hpw: u8,
 }
 
@@ -822,7 +822,7 @@ pub struct Cdw11FeatureErrorRecovery {
 /// Interrupt Coalescing feature (08h). See NVMe Base 2.3 Figure 474.
 #[bitfield(u32)]
 pub struct Cdw11FeatureInterruptCoalescing {
-    /// Aggregation Threshold (0's based)
+    /// Aggregation Threshold (0-based)
     pub thr: u8,
     /// Aggregation Time, in 100 µs units (`0h` = no delay)
     pub time: u8,
