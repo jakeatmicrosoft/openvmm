@@ -1141,3 +1141,222 @@ async fn test_identify_reports_fixed_nn(driver: DefaultDriver) {
         "NN must remain MAX_NSID after adding a namespace"
     );
 }
+
+// =============================================================================
+// Mandatory Set/Get Features compliance (NVMe Base 2.3 §3.1.3.6, Figure 32).
+//
+// An I/O controller must *accept* every mandatory feature and round-trip its
+// CDW11 rather than aborting with Invalid Field in Command. These tests submit
+// real admin Set/Get Features commands through the controller and verify the
+// stored value is echoed back.
+
+fn set_feature_command(fid: spec::Feature, cdw11: u32) -> spec::Command {
+    let mut command = spec::Command::new_zeroed();
+    command.cdw0.set_opcode(spec::AdminOpcode::SET_FEATURES.0);
+    command.cdw10 = spec::Cdw10SetFeatures::new().with_fid(fid.0).into();
+    command.cdw11 = cdw11;
+    command
+}
+
+fn get_feature_command(fid: spec::Feature, cdw11: u32) -> spec::Command {
+    let mut command = spec::Command::new_zeroed();
+    command.cdw0.set_opcode(spec::AdminOpcode::GET_FEATURES.0);
+    command.cdw10 = spec::Cdw10GetFeatures::new().with_fid(fid.0).into();
+    command.cdw11 = cdw11;
+    command
+}
+
+/// Submits a single admin command in slot `admin_slot` and returns its
+/// completion.
+async fn submit_admin_command(
+    nvmec: &mut NvmeController,
+    gm: &GuestMemory,
+    asq: &PrpRange,
+    acq: &PrpRange,
+    int_controller: &TestPciInterruptController,
+    driver: DefaultDriver,
+    admin_slot: u32,
+    command: &spec::Command,
+) -> spec::Completion {
+    write_command_to_queue(gm, asq, admin_slot as usize, command);
+    nvmec
+        .write_bar0(0x1000, (admin_slot + 1).as_bytes())
+        .unwrap();
+    wait_for_msi(driver, int_controller, 1000, 0xfeed0000, 0x1111).await;
+    read_completion_from_queue(gm, acq, admin_slot as usize)
+}
+
+#[async_test]
+async fn test_mandatory_features_roundtrip(driver: DefaultDriver) {
+    let acq = PrpRange::new(vec![0], 0, PAGE_SIZE64).unwrap();
+    let asq = PrpRange::new(vec![0x1000], 0, PAGE_SIZE64).unwrap();
+    let gm = test_memory();
+    let int_controller = TestPciInterruptController::new();
+
+    let mut nvmec = instantiate_and_build_admin_queue(
+        &acq,
+        64,
+        &asq,
+        64,
+        true,
+        Some(&int_controller),
+        driver.clone(),
+        &gm,
+    )
+    .await;
+
+    let mut admin_slot = 0u32;
+
+    // Helper: submit a command, assert its status, and return the completion.
+    macro_rules! submit {
+        ($command:expr, $expected_status:expr) => {{
+            let cqe = submit_admin_command(
+                &mut nvmec,
+                &gm,
+                &asq,
+                &acq,
+                &int_controller,
+                driver.clone(),
+                admin_slot,
+                &$command,
+            )
+            .await;
+            assert_eq!(
+                cqe.status.status(),
+                spec::Status($expected_status).0,
+                "unexpected status for admin_slot {admin_slot}"
+            );
+            admin_slot += 1;
+            cqe
+        }};
+    }
+
+    // Features whose entire CDW11 round-trips verbatim.
+    for (fid, cdw11) in [
+        (spec::Feature::ARBITRATION, 0x0102_0304u32),
+        (
+            spec::Feature::ERROR_RECOVERY,
+            u32::from(
+                spec::Cdw11FeatureErrorRecovery::new()
+                    .with_tler(100)
+                    .with_dulbe(true),
+            ),
+        ),
+        (
+            spec::Feature::INTERRUPT_COALESCING,
+            u32::from(
+                spec::Cdw11FeatureInterruptCoalescing::new()
+                    .with_thr(8)
+                    .with_time(16),
+            ),
+        ),
+    ] {
+        submit!(set_feature_command(fid, cdw11), spec::Status::SUCCESS.0);
+        let cqe = submit!(get_feature_command(fid, 0), spec::Status::SUCCESS.0);
+        assert_eq!(cqe.dw0, cdw11, "feature {fid:?} did not round-trip");
+    }
+
+    // Power Management: PS 0 is accepted, PS != 0 is rejected.
+    let pm = u32::from(
+        spec::Cdw11FeaturePowerManagement::new()
+            .with_ps(0)
+            .with_wh(2),
+    );
+    submit!(
+        set_feature_command(spec::Feature::POWER_MANAGEMENT, pm),
+        spec::Status::SUCCESS.0
+    );
+    let cqe = submit!(
+        get_feature_command(spec::Feature::POWER_MANAGEMENT, 0),
+        spec::Status::SUCCESS.0
+    );
+    assert_eq!(cqe.dw0, pm);
+    submit!(
+        set_feature_command(
+            spec::Feature::POWER_MANAGEMENT,
+            spec::Cdw11FeaturePowerManagement::new().with_ps(1).into(),
+        ),
+        spec::Status::INVALID_FIELD_IN_COMMAND.0
+    );
+
+    // Temperature Threshold: accepted but stateless — the emulator models no
+    // temperature sensors, so Set is ignored and Get reports the reset defaults.
+    submit!(
+        set_feature_command(
+            spec::Feature::TEMPERATURE_THRESHOLD,
+            spec::Cdw11FeatureTemperatureThreshold::new()
+                .with_tmpth(350)
+                .with_tmpsel(0)
+                .with_thsel(0)
+                .into(),
+        ),
+        spec::Status::SUCCESS.0
+    );
+    // Over-temperature threshold defaults to the maximum (effectively disabled).
+    let over = spec::Cdw11FeatureTemperatureThreshold::new().with_thsel(0);
+    let cqe = submit!(
+        get_feature_command(spec::Feature::TEMPERATURE_THRESHOLD, over.into()),
+        spec::Status::SUCCESS.0
+    );
+    assert_eq!(
+        spec::Cdw11FeatureTemperatureThreshold::from(cqe.dw0).tmpth(),
+        0xffff
+    );
+    // Under-temperature threshold defaults to zero.
+    let under = spec::Cdw11FeatureTemperatureThreshold::new().with_thsel(1);
+    let cqe = submit!(
+        get_feature_command(spec::Feature::TEMPERATURE_THRESHOLD, under.into()),
+        spec::Status::SUCCESS.0
+    );
+    assert_eq!(
+        spec::Cdw11FeatureTemperatureThreshold::from(cqe.dw0).tmpth(),
+        0x0000
+    );
+
+    // Interrupt Vector Configuration: valid vector accepted, unknown rejected.
+    let ivc = spec::Cdw11FeatureInterruptVectorConfig::new()
+        .with_iv(0)
+        .with_cd(true);
+    submit!(
+        set_feature_command(spec::Feature::INTERRUPT_VECTOR_CONFIG, ivc.into()),
+        spec::Status::SUCCESS.0
+    );
+    let cqe = submit!(
+        get_feature_command(
+            spec::Feature::INTERRUPT_VECTOR_CONFIG,
+            spec::Cdw11FeatureInterruptVectorConfig::new()
+                .with_iv(0)
+                .into(),
+        ),
+        spec::Status::SUCCESS.0
+    );
+    assert_eq!(cqe.dw0, u32::from(ivc));
+    submit!(
+        set_feature_command(
+            spec::Feature::INTERRUPT_VECTOR_CONFIG,
+            spec::Cdw11FeatureInterruptVectorConfig::new()
+                .with_iv(0xffff)
+                .into(),
+        ),
+        spec::Status::INVALID_FIELD_IN_COMMAND.0
+    );
+
+    // Save (Set) and non-current Select (Get) are unsupported because
+    // Identify Controller ONCS.SSFS is 0: they must be rejected rather than
+    // silently applied.
+    let mut save_cmd = set_feature_command(spec::Feature::ARBITRATION, 0);
+    save_cmd.cdw10 = spec::Cdw10SetFeatures::new()
+        .with_fid(spec::Feature::ARBITRATION.0)
+        .with_save(true)
+        .into();
+    submit!(save_cmd, spec::Status::FEATURE_IDENTIFIER_NOT_SAVEABLE.0);
+
+    let mut sel_cmd = get_feature_command(spec::Feature::ARBITRATION, 0);
+    sel_cmd.cdw10 = spec::Cdw10GetFeatures::new()
+        .with_fid(spec::Feature::ARBITRATION.0)
+        .with_sel(1)
+        .into();
+    submit!(sel_cmd, spec::Status::INVALID_FIELD_IN_COMMAND.0);
+
+    let _ = admin_slot;
+}

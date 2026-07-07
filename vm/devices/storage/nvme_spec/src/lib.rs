@@ -760,6 +760,87 @@ pub struct Cdw11FeatureAsyncEventConfig {
     _higher_bits: u32,
 }
 
+/// Arbitration feature (01h). See NVMe Base 2.3 Figure 404.
+#[bitfield(u32)]
+pub struct Cdw11FeatureArbitration {
+    /// Arbitration Burst (power-of-two burst; `111b` means no limit)
+    #[bits(3)]
+    pub ab: u8,
+    #[bits(5)]
+    _rsvd: u8,
+    /// Low Priority Weight (0's based)
+    pub lpw: u8,
+    /// Medium Priority Weight (0's based)
+    pub mpw: u8,
+    /// High Priority Weight (0's based)
+    pub hpw: u8,
+}
+
+/// Power Management feature (02h). See NVMe Base 2.3 Figure 405.
+#[bitfield(u32)]
+pub struct Cdw11FeaturePowerManagement {
+    /// Power State
+    #[bits(5)]
+    pub ps: u8,
+    /// Workload Hint
+    #[bits(3)]
+    pub wh: u8,
+    #[bits(24)]
+    _rsvd: u32,
+}
+
+/// Temperature Threshold feature (04h). See NVMe Base 2.3 Figure 407.
+#[bitfield(u32)]
+pub struct Cdw11FeatureTemperatureThreshold {
+    /// Temperature Threshold, in Kelvin
+    pub tmpth: u16,
+    /// Threshold Temperature Select (`0h` = composite, `1h`-`8h` = sensors,
+    /// `Fh` = all sensors on a Set)
+    #[bits(4)]
+    pub tmpsel: u8,
+    /// Threshold Type Select (`00b` = over-temperature, `01b` = under-temperature)
+    #[bits(2)]
+    pub thsel: u8,
+    /// Temperature Threshold Hysteresis
+    #[bits(3)]
+    pub tmpthh: u8,
+    #[bits(7)]
+    _rsvd: u8,
+}
+
+/// Error Recovery feature (05h). See NVM Command Set 1.2 Figure 96.
+#[bitfield(u32)]
+pub struct Cdw11FeatureErrorRecovery {
+    /// Time Limited Error Recovery, in 100 ms units
+    pub tler: u16,
+    /// Deallocated or Unwritten Logical Block Error Enable
+    pub dulbe: bool,
+    #[bits(15)]
+    _rsvd: u16,
+}
+
+/// Interrupt Coalescing feature (08h). See NVMe Base 2.3 Figure 474.
+#[bitfield(u32)]
+pub struct Cdw11FeatureInterruptCoalescing {
+    /// Aggregation Threshold (0's based)
+    pub thr: u8,
+    /// Aggregation Time, in 100 µs units (`0h` = no delay)
+    pub time: u8,
+    #[bits(16)]
+    _rsvd: u16,
+}
+
+/// Interrupt Vector Configuration feature (09h). See NVMe Base 2.3 Figure 475.
+#[bitfield(u32)]
+pub struct Cdw11FeatureInterruptVectorConfig {
+    /// Interrupt Vector
+    pub iv: u16,
+    /// Coalescing Disable
+    pub cd: bool,
+    #[bits(15)]
+    _rsvd: u16,
+}
+
 #[bitfield(u32)]
 pub struct Cdw10CreateIoQueue {
     pub qid: u16,

@@ -125,6 +125,50 @@ pub struct AdminState {
     send_changed_namespace: futures::channel::mpsc::Sender<u32>,
     #[inspect(skip)]
     poll_namespace_change: BTreeMap<u32, Task<()>>,
+    #[inspect(flatten)]
+    features: FeatureState,
+}
+
+/// Stored configuration for the mandatory Set/Get Features that the controller
+/// accepts and echoes back but does not otherwise act upon. Storing and echoing
+/// these values satisfies the NVMe Base 2.3 §3.1.3.6 (Figure 32) requirement
+/// that an I/O controller accept every mandatory feature.
+#[derive(Inspect)]
+struct FeatureState {
+    #[inspect(hex)]
+    arbitration: u32,
+    #[inspect(hex)]
+    power_management: u32,
+    #[inspect(hex)]
+    error_recovery: u32,
+    #[inspect(hex)]
+    interrupt_coalescing: u32,
+    /// Coalescing Disable bit per interrupt vector, indexed by interrupt vector.
+    #[inspect(iter_by_index)]
+    interrupt_vector_coalescing_disable: Vec<bool>,
+}
+
+impl FeatureState {
+    fn new(num_interrupt_vectors: usize) -> Self {
+        Self {
+            arbitration: 0,
+            power_management: 0,
+            error_recovery: 0,
+            interrupt_coalescing: 0,
+            interrupt_vector_coalescing_disable: vec![false; num_interrupt_vectors],
+        }
+    }
+}
+
+/// The Temperature Threshold value reported for the requested threshold type.
+///
+/// The emulator models no temperature sensors, so thresholds never trip and no
+/// state needs to be stored: Set Features is accepted and ignored, and Get
+/// Features always reports the reset defaults — an over-temperature threshold
+/// of the maximum (effectively disabled) and an under-temperature threshold of
+/// zero.
+fn default_temperature_threshold(thsel: u8) -> u16 {
+    if thsel == 0 { 0xffff } else { 0x0000 }
 }
 
 #[derive(Inspect)]
@@ -189,6 +233,7 @@ impl AdminState {
             recv_changed_namespace,
             send_changed_namespace,
             poll_namespace_change,
+            features: FeatureState::new(handler.config.interrupts.len()),
         };
         state.set_max_queues(handler, handler.config.max_sqs, handler.config.max_cqs);
         state
@@ -678,7 +723,13 @@ impl AdminHandler {
     ) -> Result<CommandResult, NvmeError> {
         let cdw10: spec::Cdw10SetFeatures = command.cdw10.into();
         let mut dw = [0; 2];
-        // Note that we don't support non-zero cdw10.save, since ONCS.save == 0.
+        // This controller does not support saving feature values across power
+        // cycles or resets (Identify Controller ONCS.SSFS is 0), so a request
+        // to save a feature value must be rejected rather than silently applied
+        // for the current power cycle only.
+        if cdw10.save() {
+            return Err(spec::Status::FEATURE_IDENTIFIER_NOT_SAVEABLE.into());
+        }
         match spec::Feature(cdw10.fid()) {
             spec::Feature::NUMBER_OF_QUEUES => {
                 if state.io_sqs.iter().any(|sq| sq.is_some())
@@ -718,6 +769,41 @@ impl AdminHandler {
                 // relevant bits before firing each notification class.
                 state.async_event_config = command.cdw11;
             }
+            spec::Feature::ARBITRATION => {
+                state.features.arbitration = command.cdw11;
+            }
+            spec::Feature::POWER_MANAGEMENT => {
+                let cdw11 = spec::Cdw11FeaturePowerManagement::from(command.cdw11);
+                // Only power state 0 is supported (NPSS is 0 in the Identify
+                // Controller data structure, i.e. one power state).
+                if cdw11.ps() != 0 {
+                    return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
+                }
+                state.features.power_management = command.cdw11;
+            }
+            spec::Feature::TEMPERATURE_THRESHOLD => {
+                let cdw11 = spec::Cdw11FeatureTemperatureThreshold::from(command.cdw11);
+                // Only over- and under-temperature thresholds are defined.
+                if cdw11.thsel() > 1 {
+                    return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
+                }
+                // Accepted and ignored: the emulator models no temperature.
+            }
+            spec::Feature::ERROR_RECOVERY => {
+                state.features.error_recovery = command.cdw11;
+            }
+            spec::Feature::INTERRUPT_COALESCING => {
+                state.features.interrupt_coalescing = command.cdw11;
+            }
+            spec::Feature::INTERRUPT_VECTOR_CONFIG => {
+                let cdw11 = spec::Cdw11FeatureInterruptVectorConfig::from(command.cdw11);
+                let cd = state
+                    .features
+                    .interrupt_vector_coalescing_disable
+                    .get_mut(cdw11.iv() as usize)
+                    .ok_or(spec::Status::INVALID_FIELD_IN_COMMAND)?;
+                *cd = cdw11.cd();
+            }
             feature => {
                 tracelimit::warn_ratelimited!(?feature, "unsupported feature");
                 return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
@@ -734,7 +820,12 @@ impl AdminHandler {
         let cdw10: spec::Cdw10GetFeatures = command.cdw10.into();
         let mut dw = [0; 2];
 
-        // Note that we don't support non-zero cdw10.sel, since ONCS.save == 0.
+        // Only the current value (Select 000b) is supported; the controller
+        // does not support default/saved/supported-capabilities selects
+        // (Identify Controller ONCS.SSFS is 0).
+        if cdw10.sel() != 0 {
+            return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
+        }
         match spec::Feature(cdw10.fid()) {
             spec::Feature::NUMBER_OF_QUEUES => {
                 let num_cqs = state.io_cqs.len();
@@ -766,6 +857,41 @@ impl AdminHandler {
                     .ok_or(spec::Status::INVALID_NAMESPACE_OR_FORMAT)?;
 
                 return namespace.get_feature(command).await;
+            }
+            spec::Feature::ARBITRATION => {
+                dw[0] = state.features.arbitration;
+            }
+            spec::Feature::POWER_MANAGEMENT => {
+                dw[0] = state.features.power_management;
+            }
+            spec::Feature::TEMPERATURE_THRESHOLD => {
+                let cdw11 = spec::Cdw11FeatureTemperatureThreshold::from(command.cdw11);
+                if cdw11.thsel() > 1 {
+                    return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
+                }
+                dw[0] = spec::Cdw11FeatureTemperatureThreshold::new()
+                    .with_tmpth(default_temperature_threshold(cdw11.thsel()))
+                    .with_tmpsel(cdw11.tmpsel())
+                    .with_thsel(cdw11.thsel())
+                    .into();
+            }
+            spec::Feature::ERROR_RECOVERY => {
+                dw[0] = state.features.error_recovery;
+            }
+            spec::Feature::INTERRUPT_COALESCING => {
+                dw[0] = state.features.interrupt_coalescing;
+            }
+            spec::Feature::INTERRUPT_VECTOR_CONFIG => {
+                let cdw11 = spec::Cdw11FeatureInterruptVectorConfig::from(command.cdw11);
+                let cd = *state
+                    .features
+                    .interrupt_vector_coalescing_disable
+                    .get(cdw11.iv() as usize)
+                    .ok_or(spec::Status::INVALID_FIELD_IN_COMMAND)?;
+                dw[0] = spec::Cdw11FeatureInterruptVectorConfig::new()
+                    .with_iv(cdw11.iv())
+                    .with_cd(cd)
+                    .into();
             }
             feature => {
                 tracelimit::warn_ratelimited!(?feature, "unsupported feature");
