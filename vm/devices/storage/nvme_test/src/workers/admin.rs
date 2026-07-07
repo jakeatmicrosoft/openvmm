@@ -862,6 +862,19 @@ impl AdminHandler {
                     tracing::debug!(nsid = command.nsid, "inactive namespace id");
                 }
             }
+            spec::Cns::SPECIFIC_CONTROLLER_IO_COMMAND_SET => {
+                // CSI is in Command Dword 11, bits 31:24. Only the NVM command
+                // set (CSI 0h) is supported, and it defines no I/O Command Set
+                // specific Identify Controller data structure, so return a
+                // zero-filled structure per NVMe Base 2.3 section 5.2.13.2.6.
+                // Any other command set is unsupported.
+                let csi = (command.cdw11 >> 24) as u8;
+                if csi != 0 {
+                    return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());
+                }
+                // The buffer is already zero-filled; fall through to write it
+                // back to the host.
+            }
             cns => {
                 tracelimit::warn_ratelimited!(?cns, "unsupported cns");
                 return Err(spec::Status::INVALID_FIELD_IN_COMMAND.into());

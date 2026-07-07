@@ -1360,3 +1360,78 @@ async fn test_mandatory_features_roundtrip(driver: DefaultDriver) {
 
     let _ = admin_slot;
 }
+
+/// CNS 06h (I/O Command Set specific Identify Controller): the NVM command set
+/// (CSI 0h) defines no such data structure, so the controller must return a
+/// zero-filled 4096-byte structure (NVMe Base 2.3 §5.2.13.2.6). A request for
+/// an unsupported command set is rejected with Invalid Field in Command.
+#[async_test]
+async fn test_identify_io_command_set_specific_controller(driver: DefaultDriver) {
+    let acq = PrpRange::new(vec![0], 0, PAGE_SIZE64).unwrap();
+    let asq = PrpRange::new(vec![0x1000], 0, PAGE_SIZE64).unwrap();
+    let gm = test_memory();
+    let int_controller = TestPciInterruptController::new();
+
+    let mut nvmec = instantiate_and_build_admin_queue(
+        &acq,
+        64,
+        &asq,
+        64,
+        true,
+        Some(&int_controller),
+        driver.clone(),
+        &gm,
+    )
+    .await;
+
+    let data_gpa = 0x8000u64;
+    // Pre-fill the target with a non-zero pattern to prove the controller
+    // actually writes a zero-filled structure back.
+    gm.write_plain::<[u8; 4096]>(data_gpa, &[0xff; 4096])
+        .unwrap();
+
+    let mut cmd = spec::Command::new_zeroed();
+    cmd.cdw0.set_opcode(spec::AdminOpcode::IDENTIFY.0);
+    cmd.cdw10 = spec::Cdw10Identify::new()
+        .with_cns(spec::Cns::SPECIFIC_CONTROLLER_IO_COMMAND_SET.0)
+        .into();
+    cmd.cdw11 = 0; // CSI 0h (NVM command set)
+    cmd.dptr[0] = data_gpa;
+
+    let cqe = submit_admin_command(
+        &mut nvmec,
+        &gm,
+        &asq,
+        &acq,
+        &int_controller,
+        driver.clone(),
+        0,
+        &cmd,
+    )
+    .await;
+    assert_eq!(cqe.status.status(), spec::Status::SUCCESS.0);
+    let data = gm.read_plain::<[u8; 4096]>(data_gpa).unwrap();
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "CNS 06h must return a zero-filled structure"
+    );
+
+    // A request for a command set the controller does not support (CSI 1h) must
+    // be aborted with Invalid Field in Command.
+    cmd.cdw11 = 1 << 24;
+    let cqe = submit_admin_command(
+        &mut nvmec,
+        &gm,
+        &asq,
+        &acq,
+        &int_controller,
+        driver.clone(),
+        1,
+        &cmd,
+    )
+    .await;
+    assert_eq!(
+        cqe.status.status(),
+        spec::Status::INVALID_FIELD_IN_COMMAND.0
+    );
+}
