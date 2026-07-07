@@ -70,6 +70,10 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, Serial16550DeviceHandle>
             io.0.into_io(),
         );
 
+        let debugger_poll_timer = resource
+            .debugger_mode
+            .then(|| pal_async::timer::PolledTimer::new(&input.task_driver_source.simple()));
+
         let device = Serial16550::new(
             input.device_name.to_string(),
             resource.base,
@@ -77,6 +81,7 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, Serial16550DeviceHandle>
             interrupt,
             io,
             resource.wait_for_rts,
+            debugger_poll_timer,
         )
         .map_err(Resolve16550Error::Configuration)?;
 

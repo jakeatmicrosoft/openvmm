@@ -8,8 +8,11 @@ use futures::AsyncRead;
 use futures::AsyncWrite;
 use futures::future::poll_fn;
 use inspect::InspectMut;
+use pal_async::driver::Driver;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
+use pal_async::timer::Instant;
+use pal_async::timer::PolledTimer;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io;
@@ -18,10 +21,24 @@ use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use std::time::Duration;
 
 const RX_RING_CAP: usize = 16 * 1024;
 const TX_RING_CAP: usize = 16 * 1024;
 const PUMP_CHUNK: usize = 1024;
+
+/// How often the pump is allowed to drain (and drop from) an already-full RX
+/// ring.
+///
+/// Once the guest stops draining and the RX ring fills, the pump must keep
+/// reading the backend so the debugger transport never deadlocks, dropping the
+/// newest bytes that do not fit. Doing that as fast as an always-ready backend
+/// can supply data burns CPU for no benefit, so while the ring stays full the
+/// pump only drains once per this interval. This bounds the wasted CPU without
+/// changing the drop-newest / never-backpressure-the-guest semantics: bytes are
+/// still dropped when the ring is full, the transport is still drained, and the
+/// pump resumes draining at full speed the instant the device frees ring space.
+const PUMP_DRAIN_THROTTLE: Duration = Duration::from_millis(1);
 
 /// Maximum number of productive pump iterations in a single poll before the pump
 /// yields back to the executor.
@@ -74,7 +91,7 @@ struct WakeList(Vec<Waker>);
 impl DebuggerRelay {
     /// Wraps `inner`, spawning a pump task on `driver` to relay data in both
     /// directions. `name` labels the spawned task for diagnostics.
-    pub fn new(driver: impl Spawn, name: &str, inner: Box<dyn SerialIo>) -> Self {
+    pub fn new(driver: impl Spawn + Driver, name: &str, inner: Box<dyn SerialIo>) -> Self {
         let connected = inner.is_connected();
         let shared = Arc::new(Mutex::new(Inner {
             rx: RingBuf::new(RX_RING_CAP),
@@ -89,9 +106,10 @@ impl DebuggerRelay {
         }));
 
         let pump_shared = shared.clone();
+        let timer = PolledTimer::new(&driver);
         let task_name = format!("{name}-serial-debugger-relay");
         let pump = driver.spawn(task_name, async move {
-            run_pump(inner, pump_shared).await;
+            run_pump(inner, pump_shared, Some(timer)).await;
         });
 
         Self {
@@ -108,7 +126,7 @@ impl DebuggerRelay {
 /// place.
 pub fn apply_debugger_mode(
     debugger_mode: bool,
-    driver: impl Spawn,
+    driver: impl Spawn + Driver,
     name: &str,
     io: Box<dyn SerialIo>,
 ) -> Box<dyn SerialIo> {
@@ -133,6 +151,10 @@ impl RingBuf {
 
     fn is_empty(&self) -> bool {
         self.buf.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.buf.len() >= self.cap
     }
 
     fn clear(&mut self) -> usize {
@@ -221,9 +243,16 @@ impl Inner {
     }
 }
 
-async fn run_pump(mut inner: Box<dyn SerialIo>, shared: Arc<Mutex<Inner>>) {
+async fn run_pump(
+    mut inner: Box<dyn SerialIo>,
+    shared: Arc<Mutex<Inner>>,
+    mut throttle: Option<PolledTimer>,
+) {
     let mut rx_buf = [0; PUMP_CHUNK];
     let mut tx_buf = [0; PUMP_CHUNK];
+    // The earliest time the pump may drain an already-full RX ring again. See
+    // [`PUMP_DRAIN_THROTTLE`].
+    let mut rx_next_drain: Option<Instant> = None;
 
     poll_fn(move |cx| {
         let mut budget = PUMP_POLL_BUDGET;
@@ -247,31 +276,65 @@ async fn run_pump(mut inner: Box<dyn SerialIo>, shared: Arc<Mutex<Inner>>) {
             }
 
             if shared.lock().connected {
-                match Pin::new(&mut inner).poll_read(cx, &mut rx_buf) {
-                    Poll::Ready(Ok(0)) => {
-                        let mut wakes = WakeList::default();
-                        made_progress |= shared.lock().disconnect(&mut wakes);
-                        wakes.wake();
-                    }
-                    Poll::Ready(Ok(n)) => {
-                        let mut wakes = WakeList::default();
-                        {
-                            let mut state = shared.lock();
-                            let dropped = state.rx.push_drop_newest(&rx_buf[..n]);
-                            state.rx_dropped += dropped as u64;
-                            if dropped < n {
-                                state.wake_rx(&mut wakes);
+                // While the RX ring is full we must keep draining the backend
+                // (dropping the newest bytes) so the transport never deadlocks,
+                // but draining as fast as an always-ready backend can supply
+                // data wastes CPU. Bound the drain rate in that case. This does
+                // not change semantics: bytes are still dropped when full, the
+                // transport is still drained, and full-speed draining resumes
+                // the instant the device frees ring space. `throttle` is `None`
+                // only in unit tests that drive the un-throttled loop directly.
+                let drain_now = if shared.lock().rx.is_full() {
+                    match &mut throttle {
+                        Some(timer) => {
+                            let now = Instant::now();
+                            match rx_next_drain {
+                                Some(deadline) if now < deadline => {
+                                    // Not yet time to drain again. Wake on the
+                                    // timer, or early via `pump_waker` when the
+                                    // device frees ring space.
+                                    timer.poll_until(cx, deadline).is_ready()
+                                }
+                                _ => {
+                                    rx_next_drain = Some(now + PUMP_DRAIN_THROTTLE);
+                                    true
+                                }
                             }
                         }
-                        wakes.wake();
-                        made_progress = true;
+                        None => true,
                     }
-                    Poll::Ready(Err(_)) => {
-                        let mut wakes = WakeList::default();
-                        made_progress |= shared.lock().disconnect(&mut wakes);
-                        wakes.wake();
+                } else {
+                    rx_next_drain = None;
+                    true
+                };
+
+                if drain_now {
+                    match Pin::new(&mut inner).poll_read(cx, &mut rx_buf) {
+                        Poll::Ready(Ok(0)) => {
+                            let mut wakes = WakeList::default();
+                            made_progress |= shared.lock().disconnect(&mut wakes);
+                            wakes.wake();
+                        }
+                        Poll::Ready(Ok(n)) => {
+                            let mut wakes = WakeList::default();
+                            {
+                                let mut state = shared.lock();
+                                let dropped = state.rx.push_drop_newest(&rx_buf[..n]);
+                                state.rx_dropped += dropped as u64;
+                                if dropped < n {
+                                    state.wake_rx(&mut wakes);
+                                }
+                            }
+                            wakes.wake();
+                            made_progress = true;
+                        }
+                        Poll::Ready(Err(_)) => {
+                            let mut wakes = WakeList::default();
+                            made_progress |= shared.lock().disconnect(&mut wakes);
+                            wakes.wake();
+                        }
+                        Poll::Pending => {}
                     }
-                    Poll::Pending => {}
                 }
             }
 
@@ -867,7 +930,7 @@ mod tests {
         handle.set_infinite_read();
         handle.panic_after_read_polls(PUMP_POLL_BUDGET as usize + 16);
 
-        let fut = run_pump(Box::new(io), shared.clone());
+        let fut = run_pump(Box::new(io), shared.clone(), None);
         let mut fut = std::pin::pin!(fut);
 
         let (counter, waker) = CountingWaker::new();
@@ -891,7 +954,7 @@ mod tests {
         let shared = new_shared(true);
         let (io, handle) = MockSerialIo::new();
 
-        let fut = run_pump(Box::new(io), shared.clone());
+        let fut = run_pump(Box::new(io), shared.clone(), None);
         let mut fut = std::pin::pin!(fut);
 
         let (counter, waker) = CountingWaker::new();
@@ -901,6 +964,43 @@ mod tests {
         // Parked: polled the backend once, then waited without self-waking.
         assert_eq!(handle.read_polls(), 1);
         assert_eq!(counter.count(), 0);
+    }
+
+    /// With the throttle timer present (as in production), a full RX ring fed by
+    /// an always-ready backend must be drained at a bounded rate rather than
+    /// busy-dropping: a single poll fills the ring and then parks on the timer,
+    /// dropping only a bounded amount instead of the whole per-poll budget's
+    /// worth. Semantics are unchanged (the ring is still kept full/drained and
+    /// the newest bytes are still dropped); only the drop *rate* is bounded.
+    #[async_test]
+    async fn pump_throttles_drain_of_full_ring(driver: DefaultDriver) {
+        let shared = new_shared(true);
+        let (io, handle) = MockSerialIo::new();
+        handle.set_infinite_read();
+        handle.panic_after_read_polls(PUMP_POLL_BUDGET as usize + 16);
+
+        let timer = PolledTimer::new(&driver);
+        let fut = run_pump(Box::new(io), shared.clone(), Some(timer));
+        let mut fut = std::pin::pin!(fut);
+
+        let (_counter, waker) = CountingWaker::new();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(fut.as_mut().poll(&mut cx).is_pending());
+
+        let state = shared.lock();
+        // The ring was filled and is being kept drained...
+        assert_eq!(state.rx.len(), RX_RING_CAP);
+        // ...but the always-ready backend was throttled after filling it, so far
+        // fewer bytes were dropped than the un-throttled spin path would drop in
+        // a single poll (which drops >= RX_RING_CAP; see
+        // `pump_yields_instead_of_spinning`).
+        assert!(
+            state.rx_dropped <= 2 * PUMP_CHUNK as u64,
+            "dropped {} bytes; expected throttled (<= {})",
+            state.rx_dropped,
+            2 * PUMP_CHUNK
+        );
     }
 
     #[async_test]
@@ -1091,7 +1191,7 @@ mod tests {
         handle.set_infinite_read();
         handle.panic_after_read_polls(PUMP_POLL_BUDGET as usize + 16);
 
-        let fut = run_pump(Box::new(io), shared.clone());
+        let fut = run_pump(Box::new(io), shared.clone(), None);
         let mut fut = std::pin::pin!(fut);
         let (_counter, waker) = CountingWaker::new();
         let mut cx = Context::from_waker(&waker);

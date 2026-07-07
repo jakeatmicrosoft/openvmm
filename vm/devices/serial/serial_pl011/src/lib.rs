@@ -33,6 +33,9 @@ use self::spec::UARTPERIPH_ID;
 use chipset_device::ChipsetDevice;
 use chipset_device::io::IoError;
 use chipset_device::io::IoResult;
+use chipset_device::io::deferred::DeferredRead;
+use chipset_device::io::deferred::DeferredToken;
+use chipset_device::io::deferred::defer_read;
 use chipset_device::mmio::MmioIntercept;
 use chipset_device::poll_device::PollDevice;
 use futures::AsyncRead;
@@ -40,6 +43,8 @@ use futures::AsyncWrite;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
+use pal_async::timer::Instant;
+use pal_async::timer::PolledTimer;
 use serial_core::SerialIo;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
@@ -49,6 +54,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
 use std::task::ready;
+use std::time::Duration;
 use thiserror::Error;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::line_interrupt::LineInterrupt;
@@ -78,8 +84,44 @@ pub struct SerialPl011 {
     rx_waker: Option<Waker>,
     #[inspect(skip)]
     tx_waker: Option<Waker>,
+    #[inspect(skip)]
+    poll_waker: Option<Waker>,
+    #[inspect(skip)]
+    debugger_poll: Option<DebuggerPollThrottle>,
     stats: SerialStats,
 }
+
+/// State for the debugger-mode guest poll throttle.
+///
+/// When a COM port is in debugger mode, a kernel debugger (KD) typically busy-
+/// polls the port's flag register while waiting for data, generating a storm of
+/// register-read intercepts (and thus host CPU). Once the guest has read an
+/// empty RX FIFO [`DEBUGGER_EMPTY_POLL_THRESHOLD`] times in a row, subsequent
+/// such reads are deferred (via [`IoResult::Defer`]) for [`DEBUGGER_POLL_DELAY`]
+/// before completing, throttling the poll loop. The intercept always completes
+/// with the same value it would have returned; only its timing changes, and a
+/// deferred read completes early the instant real data arrives so debugger
+/// latency is unaffected. Only ever `Some` when the port is in debugger mode.
+struct DebuggerPollThrottle {
+    timer: PolledTimer,
+    /// Number of consecutive reads that observed an empty RX FIFO on a
+    /// poll register.
+    empty_streak: u32,
+    /// A read that has been deferred and is waiting to be completed.
+    pending: Option<PendingPollRead>,
+}
+
+struct PendingPollRead {
+    deferred: DeferredRead,
+    register: Register,
+    len: usize,
+    deadline: Instant,
+}
+
+/// Consecutive empty-FIFO poll reads before the throttle engages.
+const DEBUGGER_EMPTY_POLL_THRESHOLD: u32 = 8;
+/// How long each throttled poll read is deferred once the throttle engages.
+const DEBUGGER_POLL_DELAY: Duration = Duration::from_millis(4);
 
 #[derive(Inspect, Default)]
 struct SerialStats {
@@ -138,6 +180,7 @@ impl SerialPl011 {
         base: u64,
         interrupt: LineInterrupt,
         io: Box<dyn SerialIo>,
+        debugger_poll_timer: Option<PolledTimer>,
     ) -> Result<Self, ConfigurationError> {
         if base & (REGISTERS_SIZE - 1) != 0 {
             return Err(ConfigurationError::UnalignedBaseAddress(base));
@@ -152,6 +195,12 @@ impl SerialPl011 {
             io,
             rx_waker: None,
             tx_waker: None,
+            poll_waker: None,
+            debugger_poll: debugger_poll_timer.map(|timer| DebuggerPollThrottle {
+                timer,
+                empty_streak: 0,
+                pending: None,
+            }),
             stats: Default::default(),
         };
         if this.io.is_connected() {
@@ -314,6 +363,13 @@ impl SerialPl011 {
             Ok(r) => r,
         };
 
+        // In debugger mode, throttle a guest that is busy-polling an empty RX
+        // FIFO by deferring the read for a short while. See
+        // [`DebuggerPollThrottle`].
+        if let Some(token) = self.maybe_defer_debugger_poll(register, data.len()) {
+            return IoResult::Defer(token);
+        }
+
         data.fill(0);
         let val: u16 = match register {
             Register::UARTDR => self.state.read_dr().into(),
@@ -387,6 +443,103 @@ impl SerialPl011 {
         self.sync();
         IoResult::Ok
     }
+
+    /// If the port is in debugger mode and the guest is repeatedly polling an
+    /// empty RX FIFO, defers this read for a short while and returns the token
+    /// to defer the intercept. Returns `None` (read normally) otherwise.
+    ///
+    /// The registers a KD stub polls while waiting for data are the flag
+    /// register (to check the receive-FIFO-empty bit) and, for some stubs, the
+    /// data register directly.
+    fn maybe_defer_debugger_poll(
+        &mut self,
+        register: Register,
+        len: usize,
+    ) -> Option<DeferredToken> {
+        let is_poll_read = matches!(register, Register::UARTFR | Register::UARTDR);
+        let rx_empty = self.state.rx_buffer.is_empty();
+
+        let dp = self.debugger_poll.as_mut()?;
+        if !is_poll_read {
+            return None;
+        }
+        if !rx_empty {
+            // The guest is making progress; reset the streak.
+            dp.empty_streak = 0;
+            return None;
+        }
+        // Only one deferred read may be outstanding (the guest vCPU is blocked
+        // on it and cannot issue another).
+        if dp.pending.is_some() {
+            return None;
+        }
+        dp.empty_streak = dp.empty_streak.saturating_add(1);
+        if dp.empty_streak <= DEBUGGER_EMPTY_POLL_THRESHOLD {
+            return None;
+        }
+
+        let (deferred, token) = defer_read();
+        dp.pending = Some(PendingPollRead {
+            deferred,
+            register,
+            len,
+            deadline: Instant::now() + DEBUGGER_POLL_DELAY,
+        });
+        // Ensure `poll_device` runs to arm the timer and later complete the read.
+        if let Some(waker) = self.poll_waker.take() {
+            waker.wake();
+        }
+        Some(token)
+    }
+
+    /// Completes a deferred debugger-mode poll read once its delay has elapsed,
+    /// or immediately if RX data has arrived in the meantime (so debugger
+    /// latency is unaffected).
+    fn complete_debugger_poll(&mut self, cx: &mut Context<'_>) {
+        let Some((register, len, deadline)) = self
+            .debugger_poll
+            .as_ref()
+            .and_then(|dp| dp.pending.as_ref())
+            .map(|p| (p.register, p.len, p.deadline))
+        else {
+            return;
+        };
+
+        let data_ready = !self.state.rx_buffer.is_empty();
+        let timer_expired = if data_ready {
+            false
+        } else {
+            self.debugger_poll
+                .as_mut()
+                .unwrap()
+                .timer
+                .poll_until(cx, deadline)
+                .is_ready()
+        };
+
+        if !data_ready && !timer_expired {
+            return;
+        }
+
+        // Compute the value now, so a read that completes because data arrived
+        // reflects that data.
+        let val: u16 = match register {
+            Register::UARTFR => self.state.read_fr(),
+            Register::UARTDR => self.state.read_dr().into(),
+            _ => 0,
+        };
+        let dp = self.debugger_poll.as_mut().unwrap();
+        let pending = dp.pending.take().unwrap();
+        if data_ready {
+            dp.empty_streak = 0;
+        }
+        // Match the synchronous read path, which zero-fills `data` and then
+        // writes the (little-endian) register value into the low bytes, so
+        // wider-than-register accesses are handled the same way.
+        let mut bytes = [0u8; 8];
+        bytes[..2].copy_from_slice(&val.to_le_bytes());
+        pending.deferred.complete(&bytes[..len]);
+    }
 }
 
 impl ChangeDeviceState for SerialPl011 {
@@ -413,8 +566,10 @@ impl ChipsetDevice for SerialPl011 {
 
 impl PollDevice for SerialPl011 {
     fn poll_device(&mut self, cx: &mut Context<'_>) {
+        self.poll_waker = Some(cx.waker().clone());
         let _ = self.poll_tx(cx);
         let _ = self.poll_rx(cx);
+        self.complete_debugger_poll(cx);
         self.sync();
     }
 }
@@ -925,6 +1080,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1031,6 +1187,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1164,6 +1321,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1222,6 +1380,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1250,6 +1409,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1274,6 +1434,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(serial_io),
+            None,
         )
         .unwrap();
 
@@ -1446,6 +1607,7 @@ mod tests {
             PL011_SERIAL0_BASE,
             LineInterrupt::detached(),
             Box::new(DebuggerRelay::new(driver, "com1", Box::new(backend))),
+            None,
         )
         .unwrap()
     }
@@ -1526,5 +1688,115 @@ mod tests {
             0,
             "TX FIFO should be empty with debugger relay"
         );
+    }
+
+    fn new_throttle_serial(driver: DefaultDriver, backend: DebuggerBackend) -> SerialPl011 {
+        SerialPl011::new(
+            "com1".to_string(),
+            PL011_SERIAL0_BASE,
+            LineInterrupt::detached(),
+            Box::new(backend),
+            Some(PolledTimer::new(&driver)),
+        )
+        .unwrap()
+    }
+
+    /// Drives `poll_device` until the deferred read completes, returning the
+    /// bytes delivered to the guest.
+    async fn complete_deferred(
+        serial: &mut SerialPl011,
+        mut token: DeferredToken,
+        len: usize,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        poll_fn(|cx| {
+            serial.poll_device(cx);
+            token.poll_read(cx, &mut buf)
+        })
+        .await
+        .unwrap();
+        buf
+    }
+
+    /// After the guest polls an empty RX FIFO enough times, a debugger-mode port
+    /// defers the read (rather than completing it immediately), throttling the
+    /// poll loop. The deferred intercept still completes with the correct value.
+    #[async_test]
+    async fn debugger_poll_throttle_defers_repeated_empty_polls(driver: DefaultDriver) {
+        let (backend, _handle) = DebuggerBackend::new();
+        let mut serial = new_throttle_serial(driver, backend);
+
+        // The first reads of the empty FIFO are answered immediately.
+        for _ in 0..DEBUGGER_EMPTY_POLL_THRESHOLD {
+            let fr = read(&mut serial, Register::UARTFR);
+            assert_ne!(fr & 0x0010, 0, "RXFE should be set (FIFO empty)");
+        }
+
+        // The next poll of the still-empty FIFO is throttled: the read is
+        // deferred instead of answered synchronously.
+        let mut data = vec![0u8; 2];
+        let token = match serial.mmio_read(Register::UARTFR.0 as u64, &mut data) {
+            IoResult::Defer(token) => token,
+            other => panic!("expected deferred read, got {other:?}"),
+        };
+
+        // But it still completes, with the (still empty) FR value.
+        let out = complete_deferred(&mut serial, token, 2).await;
+        let fr = u16::from_ne_bytes(out[..2].try_into().unwrap());
+        assert_ne!(fr & 0x0010, 0, "RXFE should still be set");
+    }
+
+    /// A deferred debugger-mode poll completes early (without waiting out the
+    /// full delay) as soon as real data arrives, so debugger latency is not hurt.
+    #[async_test]
+    async fn debugger_poll_throttle_completes_early_when_data_arrives(driver: DefaultDriver) {
+        let (backend, handle) = DebuggerBackend::new();
+        let mut serial = new_throttle_serial(driver, backend);
+
+        for _ in 0..DEBUGGER_EMPTY_POLL_THRESHOLD {
+            read(&mut serial, Register::UARTFR);
+        }
+        let mut data = vec![0u8; 2];
+        let token = match serial.mmio_read(Register::UARTFR.0 as u64, &mut data) {
+            IoResult::Defer(token) => token,
+            other => panic!("expected deferred read, got {other:?}"),
+        };
+
+        // Data arrives while the poll is deferred.
+        handle.inject_rx(b"K");
+
+        // The deferred FR read completes reporting data-ready (RXFE clear)...
+        let out = complete_deferred(&mut serial, token, 2).await;
+        let fr = u16::from_ne_bytes(out[..2].try_into().unwrap());
+        assert_eq!(fr & 0x0010, 0, "RXFE should be clear: data ready");
+        // ...and the byte is now readable by the guest.
+        poll_serial(&mut serial).await;
+        assert_eq!(read(&mut serial, Register::UARTDR) as u8, b'K');
+    }
+
+    /// Without debugger mode (no throttle timer), reads are never deferred, no
+    /// matter how many times the guest polls an empty FIFO.
+    #[test]
+    fn debugger_poll_throttle_disabled_without_debugger_mode() {
+        let (backend, _handle) = DebuggerBackend::new();
+        let mut serial = SerialPl011::new(
+            "com1".to_string(),
+            PL011_SERIAL0_BASE,
+            LineInterrupt::detached(),
+            Box::new(backend),
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..(DEBUGGER_EMPTY_POLL_THRESHOLD + 4) {
+            let mut data = vec![0u8; 2];
+            assert!(
+                matches!(
+                    serial.mmio_read(Register::UARTFR.0 as u64, &mut data),
+                    IoResult::Ok
+                ),
+                "reads must never be deferred without debugger mode"
+            );
+        }
     }
 }

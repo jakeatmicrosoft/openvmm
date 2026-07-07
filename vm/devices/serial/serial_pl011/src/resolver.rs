@@ -70,8 +70,18 @@ impl AsyncResolveResource<ChipsetDeviceHandleKind, SerialPl011DeviceHandle>
             io.0.into_io(),
         );
 
-        let device = SerialPl011::new(input.device_name.to_string(), resource.base, interrupt, io)
-            .map_err(ResolvePl011Error::Configuration)?;
+        let debugger_poll_timer = resource
+            .debugger_mode
+            .then(|| pal_async::timer::PolledTimer::new(&input.task_driver_source.simple()));
+
+        let device = SerialPl011::new(
+            input.device_name.to_string(),
+            resource.base,
+            interrupt,
+            io,
+            debugger_poll_timer,
+        )
+        .map_err(ResolvePl011Error::Configuration)?;
 
         Ok(device.into())
     }
