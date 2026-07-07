@@ -1303,6 +1303,24 @@ impl AdminHandler {
         let prp = PrpRange::parse(&self.config.mem, len, command.dptr)?;
 
         match spec::LogPageIdentifier(cdw10.lid()) {
+            spec::LogPageIdentifier::SUPPORTED_LOG_PAGES => {
+                // Figure 207: one 4-byte LID Supported and Effects entry per
+                // LID (0h..=FFh), 1024 bytes total. Mark each log page this
+                // controller supports with LSUPP set.
+                let mut page = [0u32; 256];
+                let supported = spec::LidSupportedAndEffects::new().with_lsupp(true);
+                for lid in [
+                    spec::LogPageIdentifier::SUPPORTED_LOG_PAGES,
+                    spec::LogPageIdentifier::ERROR_INFORMATION,
+                    spec::LogPageIdentifier::HEALTH_INFORMATION,
+                    spec::LogPageIdentifier::FIRMWARE_SLOT_INFORMATION,
+                    spec::LogPageIdentifier::CHANGED_NAMESPACE_LIST,
+                ] {
+                    page[lid.0 as usize] = supported.into();
+                }
+                let bytes = page.as_bytes();
+                prp.write(&self.config.mem, &bytes[..len.min(bytes.len())])?;
+            }
             spec::LogPageIdentifier::ERROR_INFORMATION => {
                 // Write empty log entries.
                 prp.zero(

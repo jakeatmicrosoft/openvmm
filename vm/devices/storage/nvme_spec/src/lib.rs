@@ -899,6 +899,20 @@ open_enum! {
     }
 }
 
+/// LID Supported and Effects Data Structure, one per LID in the Supported Log
+/// Pages log page (LID 00h). See NVMe Base 2.3 Figure 208.
+#[bitfield(u32)]
+pub struct LidSupportedAndEffects {
+    /// LID Supported
+    pub lsupp: bool,
+    /// Index Offset Supported
+    pub ios: bool,
+    #[bits(14)]
+    _rsvd: u16,
+    /// LID Specific Parameter
+    pub lidsp: u16,
+}
+
 #[bitfield(u32)]
 pub struct AsynchronousEventRequestDw0 {
     #[bits(3)]

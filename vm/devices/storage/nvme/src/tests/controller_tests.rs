@@ -1438,3 +1438,64 @@ async fn test_identify_io_command_set_specific_controller(driver: DefaultDriver)
         spec::Status::INVALID_FIELD_IN_COMMAND.0
     );
 }
+
+/// The Supported Log Pages log page (LID 00h) is mandatory for an NVMe 2.0 I/O
+/// controller. It must report an LSUPP bit for each supported log page (NVMe
+/// Base 2.3 §5.2.12.1.1, Figures 207/208).
+#[async_test]
+async fn test_get_supported_log_pages(driver: DefaultDriver) {
+    let acq = PrpRange::new(vec![0], 0, PAGE_SIZE64).unwrap();
+    let asq = PrpRange::new(vec![0x1000], 0, PAGE_SIZE64).unwrap();
+    let gm = test_memory();
+    let int_controller = TestPciInterruptController::new();
+
+    let mut nvmec = instantiate_and_build_admin_queue(
+        &acq,
+        64,
+        &asq,
+        64,
+        true,
+        Some(&int_controller),
+        driver.clone(),
+        &gm,
+    )
+    .await;
+
+    let data_gpa = 0x8000u64;
+    // Pre-fill so we can confirm unsupported LIDs are reported as zero.
+    gm.write_plain::<[u8; 1024]>(data_gpa, &[0xff; 1024])
+        .unwrap();
+
+    let mut cmd = spec::Command::new_zeroed();
+    cmd.cdw0.set_opcode(spec::AdminOpcode::GET_LOG_PAGE.0);
+    // 1024 bytes = 256 dwords; NUMDL is a 0-based dword count.
+    cmd.cdw10 = spec::Cdw10GetLogPage::new()
+        .with_lid(spec::LogPageIdentifier::SUPPORTED_LOG_PAGES.0)
+        .with_numdl_z(255)
+        .into();
+    cmd.dptr[0] = data_gpa;
+
+    let cqe = submit_admin_command(
+        &mut nvmec,
+        &gm,
+        &asq,
+        &acq,
+        &int_controller,
+        driver.clone(),
+        0,
+        &cmd,
+    )
+    .await;
+    assert_eq!(cqe.status.status(), spec::Status::SUCCESS.0);
+
+    let page = gm.read_plain::<[u32; 256]>(data_gpa).unwrap();
+    let supported = [0usize, 1, 2, 3, 4];
+    for (lid, entry) in page.iter().enumerate() {
+        let lsupp = spec::LidSupportedAndEffects::from(*entry).lsupp();
+        assert_eq!(
+            lsupp,
+            supported.contains(&lid),
+            "LID {lid:#x} LSUPP bit mismatch"
+        );
+    }
+}
