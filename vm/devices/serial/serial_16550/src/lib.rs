@@ -424,6 +424,13 @@ impl Serial16550 {
         if !is_poll_read {
             return None;
         }
+        // The deferred-read mechanism packs its result into a `u64` (see
+        // `DeferredRead::complete`), so it only supports accesses up to 8 bytes.
+        // Let any wider (guest-controlled) access take the normal synchronous
+        // read path rather than deferring and panicking on completion.
+        if len > size_of::<u64>() {
+            return None;
+        }
         if !rx_empty {
             // The guest is making progress; reset the streak.
             dp.empty_streak = 0;
@@ -1265,6 +1272,28 @@ mod tests {
         // But it still completes, with the (still empty) LSR value.
         let out = complete_deferred(&mut serial, token, 1).await;
         assert_eq!(out[0] & 0x01, 0, "still no data ready");
+    }
+
+    /// A guest-controlled read wider than the deferred-read mechanism supports
+    /// (which packs its result into a `u64`) must not be deferred, even once the
+    /// throttle threshold has been reached. Otherwise completing it would panic.
+    #[async_test]
+    async fn debugger_poll_throttle_ignores_oversized_reads(driver: DefaultDriver) {
+        let (backend, _handle) = MockBackend::new();
+        let mut serial = new_throttle_serial(driver, backend);
+
+        // Reach the throttle threshold with normal 1-byte polls.
+        for _ in 0..DEBUGGER_EMPTY_POLL_THRESHOLD {
+            read_reg(&mut serial, Register::LSR);
+        }
+
+        // A wider-than-8-byte access is answered synchronously rather than
+        // deferred, so it does not reach the u64-packed completion path.
+        let mut data = [0u8; 16];
+        match serial.read(Register::LSR.0.into(), &mut data) {
+            IoResult::Ok => {}
+            other => panic!("expected synchronous read for oversized access, got {other:?}"),
+        }
     }
 
     /// A deferred debugger-mode poll completes early (without waiting out the

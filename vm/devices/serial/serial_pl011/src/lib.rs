@@ -463,6 +463,13 @@ impl SerialPl011 {
         if !is_poll_read {
             return None;
         }
+        // The deferred-read mechanism packs its result into a `u64` (see
+        // `DeferredRead::complete`), so it only supports accesses up to 8 bytes.
+        // Let any wider (guest-controlled) access take the normal synchronous
+        // read path rather than deferring and panicking on completion.
+        if len > size_of::<u64>() {
+            return None;
+        }
         if !rx_empty {
             // The guest is making progress; reset the streak.
             dp.empty_streak = 0;
@@ -1744,6 +1751,28 @@ mod tests {
         let out = complete_deferred(&mut serial, token, 2).await;
         let fr = u16::from_ne_bytes(out[..2].try_into().unwrap());
         assert_ne!(fr & 0x0010, 0, "RXFE should still be set");
+    }
+
+    /// A guest-controlled read wider than the deferred-read mechanism supports
+    /// (which packs its result into a `u64`) must not be deferred, even once the
+    /// throttle threshold has been reached. Otherwise completing it would panic.
+    #[async_test]
+    async fn debugger_poll_throttle_ignores_oversized_reads(driver: DefaultDriver) {
+        let (backend, _handle) = DebuggerBackend::new();
+        let mut serial = new_throttle_serial(driver, backend);
+
+        // Reach the throttle threshold with normal 2-byte polls.
+        for _ in 0..DEBUGGER_EMPTY_POLL_THRESHOLD {
+            read(&mut serial, Register::UARTFR);
+        }
+
+        // A wider-than-8-byte access is answered synchronously rather than
+        // deferred, so it does not reach the u64-packed completion path.
+        let mut data = vec![0u8; 16];
+        match serial.mmio_read(Register::UARTFR.0 as u64, &mut data) {
+            IoResult::Ok => {}
+            other => panic!("expected synchronous read for oversized access, got {other:?}"),
+        }
     }
 
     /// A deferred debugger-mode poll completes early (without waiting out the
