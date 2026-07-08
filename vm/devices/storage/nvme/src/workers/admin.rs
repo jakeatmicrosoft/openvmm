@@ -125,7 +125,6 @@ pub struct AdminState {
     send_changed_namespace: futures::channel::mpsc::Sender<u32>,
     #[inspect(skip)]
     poll_namespace_change: BTreeMap<u32, Task<()>>,
-    #[inspect(flatten)]
     features: FeatureState,
 }
 
