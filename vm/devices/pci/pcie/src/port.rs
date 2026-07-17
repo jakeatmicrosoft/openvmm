@@ -1294,7 +1294,8 @@ mod tests {
             None,
         );
 
-        // Set primary + secondary bus number to 1.
+        // Set the secondary and subordinate bus numbers to 1, giving the port an
+        // assigned (secondary) bus range of 1..=1. Primary bus number stays 0.
         port.cfg_space.write_u32(0x18, (1u32 << 16) | (1u32 << 8));
 
         let stats = Arc::new(Mutex::new(RoutingStats::default()));
