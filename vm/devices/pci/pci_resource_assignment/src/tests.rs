@@ -2753,3 +2753,39 @@ async fn ari_no_port_at_root_bus() {
     // non-existent downstream port.
     assign_pci_resources(&mut cfg, &params).await.unwrap();
 }
+
+/// An ARI-capable device at Device 0 on the root bus (no upstream port, so ARI
+/// Forwarding cannot be enabled) must not cause real, independent devices at
+/// higher Device Numbers to be skipped. The Device-Number -> Function-Number
+/// aliasing only applies once ARI Forwarding is enabled upstream.
+#[async_test]
+async fn ari_cap_without_forwarding_does_not_skip_real_devices() {
+    let mock = MockConfigSpace::new();
+
+    // Device 0 on the root bus: has an ARI capability but no upstream port to
+    // enable ARI Forwarding on. ARI cap terminates the Function list.
+    mock.add_endpoint(0, 0, 0, &[(0, 0x1000, false, false)]);
+    mock.add_ari_cap(0, 0, 0, 0x100, 0, 0);
+
+    // Device 1 on the root bus: a real, independent endpoint.
+    mock.add_endpoint(0, 1, 0, &[(0, 0x2000, false, false)]);
+
+    let params = AssignmentParams {
+        start_bus: 0,
+        end_bus: 255,
+        low_mmio: MemoryRange::new(0x1000_0000..0x1000_0000 + 0x1000_0000),
+        high_mmio: MemoryRange::EMPTY,
+        preserve_bars: false,
+    };
+
+    let mut cfg = mock.clone();
+    assign_pci_resources(&mut cfg, &params).await.unwrap();
+
+    // Device 1's BAR must have been programmed into the low MMIO aperture
+    // (it was not skipped). An unscanned device would leave its BAR at 0.
+    let dev1_bar = read_bar32(&mock, 0, 1, 0, 0) & !0xF;
+    assert!(
+        (0x1000_0000..0x2000_0000).contains(&dev1_bar),
+        "device 1 BAR should be programmed into the aperture, got {dev1_bar:#x}"
+    );
+}

@@ -412,12 +412,21 @@ async fn scan_bus(
             devices.push(dev);
         }
 
-        // An ARI Device occupies the entire Function-Number space of Device 0
-        // on this bus (the Device Number field is eliminated). Traditional
-        // Device Numbers 1..31 alias to ARI Function Numbers >= 8, so stop
-        // scanning further Device Numbers to avoid re-enumerating the same
-        // Extended Functions.
-        if ari_cap_f0.is_some() {
+        // When ARI Forwarding is enabled in the downstream port above, that
+        // port stops enforcing the Device Number == 0 restriction when
+        // converting Type 1 Configuration Requests to Type 0 (PCIe Base 7.0
+        // §6.13). The ARI Device below then occupies the entire Function-Number
+        // space of Device 0, and traditional Device Numbers 1..31 alias to ARI
+        // Function Numbers >= 8 (already enumerated via the linked-list walk
+        // above). Stop scanning further Device Numbers to avoid re-enumerating
+        // those Extended Functions.
+        //
+        // This aliasing only occurs once ARI Forwarding is enabled. If it was
+        // not (e.g., the root bus has no upstream port, or the port does not
+        // support ARI Forwarding), Device Numbers 1..31 are either absent
+        // (point-to-point link below a downstream port) or real, independent
+        // devices (root/conventional bus) that must still be scanned.
+        if ari_forwarding_enabled {
             break;
         }
     }
